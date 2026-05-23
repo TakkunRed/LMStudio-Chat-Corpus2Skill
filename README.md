@@ -133,12 +133,6 @@ cd LMStudio-Chat-Corpus2Skill
 uv sync
 ```
 
-または pip の場合:
-
-```bash
-pip install -r requirements.txt
-```
-
 ### 3. 環境変数の設定
 
 `.env` ファイルをプロジェクトルートに作成します。
@@ -160,7 +154,7 @@ MCP_SERVER_URL=http://localhost:8000/mcp
 uv run python main.py
 ```
 
-ブラウザで `http://localhost:8000` を開きます。
+ブラウザで `http://localhost:8021` を開きます。
 
 ---
 
