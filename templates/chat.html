@@ -114,6 +114,49 @@
             padding: 8px 10px;
             margin-bottom: 4px;
         }
+
+        /* ── メモリタブ ── */
+        .memory-item {
+            background: #0f0f1c;
+            border: 1px solid #1e1e30;
+            border-radius: 6px;
+            padding: 8px 10px;
+            margin-bottom: 4px;
+            font-size: 12px;
+            color: #ccc;
+            display: flex;
+            gap: 6px;
+            align-items: flex-start;
+        }
+        .memory-item-text {
+            flex: 1;
+            min-width: 0;
+            word-break: break-word;
+            line-height: 1.5;
+        }
+        .memory-item-time {
+            font-size: 10px;
+            color: #555;
+            margin-top: 4px;
+        }
+        .memory-delete-btn {
+            flex-shrink: 0;
+            background: #2a1a1a;
+            border: 1px solid #4a2a2a;
+            color: #f87171;
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-size: 11px;
+            cursor: pointer;
+            transition: background .2s;
+        }
+        .memory-delete-btn:hover { background: #3a1a1a; }
+        .memory-empty {
+            color: #555;
+            font-size: 12px;
+            text-align: center;
+            padding: 16px 0;
+        }
     </style>
 </head>
 <body>
@@ -128,6 +171,7 @@
             <!-- タブバー -->
             <div class="tab-bar">
                 <button class="tab-btn active" id="tabBtn-settings" onclick="switchTab('settings')">設定</button>
+                <button class="tab-btn"        id="tabBtn-memory"   onclick="switchTab('memory')">🧠 メモリ</button>
                 <button class="tab-btn"        id="tabBtn-history"  onclick="switchTab('history')">履歴</button>
             </div>
 
@@ -153,9 +197,19 @@
                 <div class="sidebar-section">
                     <label>RAG ドキュメント検索</label>
                     <div style="display:flex; align-items:center; gap:8px; margin-top:6px;">
-                        <input type="checkbox" id="ragToggle" onchange="onRagToggle()">
-                        <span id="ragToggleLabel" style="font-size:13px; color:#888;">オフ</span>
+                        <input type="checkbox" id="ragToggle" onchange="onRagToggle()" checked>
+                        <span id="ragToggleLabel" style="font-size:13px; color:#4ade80;">オン</span>
                         <span id="ragChunkBadge" style="font-size:11px; color:#555; margin-left:auto;"></span>
+                    </div>
+                </div>
+
+                <!-- メモリトグル -->
+                <div class="sidebar-section">
+                    <label>🧠 会話メモリ (mem0)</label>
+                    <div style="display:flex; align-items:center; gap:8px; margin-top:6px;">
+                        <input type="checkbox" id="memoryToggle" onchange="onMemoryToggle()" checked>
+                        <span id="memoryToggleLabel" style="font-size:13px; color:#a78bfa;">オン</span>
+                        <span id="memoryCountBadge" style="font-size:11px; color:#555; margin-left:auto;"></span>
                     </div>
                 </div>
 
@@ -171,6 +225,20 @@
                     <button class="btn-clear"    onclick="clearHistory()">🗑️ 履歴削除</button>
                     <button class="btn-settings" onclick="showSettings()">⚙️ 設定</button>
                     <a href="/logout" class="btn-logout">🚪 ログアウト</a>
+                </div>
+            </div>
+
+            <!-- ── メモリタブ ── -->
+            <div class="tab-content" id="tab-memory" style="display:none; flex-direction:column;">
+                <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0 6px; flex-shrink:0;">
+                    <span style="font-size:12px; color:#888;">記憶された情報</span>
+                    <div style="display:flex; gap:4px;">
+                        <button class="btn-small" onclick="fetchMemory()" style="padding:2px 8px;">🔄</button>
+                        <button class="btn-small" onclick="clearAllMemory()" style="padding:2px 8px; background:#2a1a1a; border-color:#4a2a2a; color:#f87171; white-space:nowrap;">🗑️ 全削除</button>
+                    </div>
+                </div>
+                <div id="memoryList" style="flex:1; overflow-y:auto;">
+                    <div class="memory-empty">メモリがありません</div>
                 </div>
             </div>
 
@@ -375,7 +443,8 @@
         let currentSessionId = "{{ session_id }}";
         let isStreaming = false;
         let currentTools = [];
-        let ragEnabled = false;
+        let ragEnabled = true;
+        let memoryEnabled = true;
 
         // ─── 初期化 ──────────────────────────────────────────────────────
         document.addEventListener('DOMContentLoaded', () => {
@@ -384,14 +453,16 @@
             updateTemperatureDisplay();
             fetchRagStatusBadge();
             loadSavedTools();
+            initMemoryStatus();
         });
 
         // ─── タブ切り替え ────────────────────────────────────────────────
         function switchTab(name) {
-            ['settings', 'history'].forEach(t => {
+            ['settings', 'memory', 'history'].forEach(t => {
                 document.getElementById(`tab-${t}`).style.display     = t === name ? 'flex' : 'none';
                 document.getElementById(`tabBtn-${t}`).classList.toggle('active', t === name);
             });
+            if (name === 'memory') fetchMemory();
         }
 
         // ─── 接続確認 ────────────────────────────────────────────────────
@@ -468,6 +539,7 @@
                         max_tokens: maxTokens,
                         tools: currentTools,
                         use_rag: ragEnabled,
+                        use_memory: memoryEnabled,
                     }),
                 });
 
@@ -507,6 +579,7 @@
                             } else if (data.type === 'meta') {
                                 ragSources = data.rag_sources || ragSources;
                                 updateHistoryList(data.history || []);
+                                if (data.memory_updated) fetchMemory();
                             } else if (data.type === 'error') {
                                 fullContent = data.content;
                                 updateStreamingBubble(bubbleId, fullContent);
@@ -1062,6 +1135,78 @@
                 el.textContent = `✅ ${data.cleared_documents}件 のドキュメントをクリアしました`;
                 document.getElementById('ragChunkBadge').textContent = '0件';
             } catch (e) { el.textContent = `⚠️ クリア失敗: ${e.message}`; }
+        }
+
+        // ─── メモリ管理 ────────────────────────────────────────────────
+        async function initMemoryStatus() {
+            try {
+                const res  = await fetch('/api/memory/status');
+                const data = await res.json();
+                if (!data.available) {
+                    document.getElementById('memoryToggleLabel').textContent = '未初期化';
+                    document.getElementById('memoryToggleLabel').style.color = '#f87171';
+                    document.getElementById('memoryToggle').title = 'サーバーを再起動するとメモリ機能が利用できます';
+                }
+            } catch { /* 無視 */ }
+        }
+
+        function onMemoryToggle() {
+            memoryEnabled = document.getElementById('memoryToggle').checked;
+            const label = document.getElementById('memoryToggleLabel');
+            label.textContent = memoryEnabled ? 'オン' : 'オフ';
+            label.style.color = memoryEnabled ? '#a78bfa' : '#888';
+            if (memoryEnabled) fetchMemory();
+        }
+
+        async function fetchMemory() {
+            const list  = document.getElementById('memoryList');
+            const badge = document.getElementById('memoryCountBadge');
+            try {
+                const res  = await fetch('/api/memory');
+                const data = await res.json();
+                const memories = data.memories || [];
+                badge.textContent = memories.length > 0 ? `${memories.length}件` : '';
+
+                if (memories.length === 0) {
+                    list.innerHTML = '<div class="memory-empty">メモリがありません</div>';
+                    return;
+                }
+                list.innerHTML = '';
+                memories.forEach(m => {
+                    const text = m.memory || m.text || '';
+                    const ts   = m.created_at || m.updated_at || '';
+                    const timeStr = ts ? new Date(ts).toLocaleString('ja-JP', {
+                        month: 'numeric', day: 'numeric',
+                        hour: '2-digit', minute: '2-digit'
+                    }) : '';
+                    const item = document.createElement('div');
+                    item.className = 'memory-item';
+                    item.innerHTML = `
+                        <div class="memory-item-text">
+                            ${escapeHtml(text)}
+                            ${timeStr ? `<div class="memory-item-time">${timeStr}</div>` : ''}
+                        </div>
+                        <button class="memory-delete-btn" onclick="deleteMemory('${m.id}')">🗑️</button>`;
+                    list.appendChild(item);
+                });
+            } catch (e) {
+                list.innerHTML = `<div class="memory-empty">取得失敗: ${e.message}</div>`;
+            }
+        }
+
+        async function deleteMemory(memoryId) {
+            try {
+                await fetch(`/api/memory/${encodeURIComponent(memoryId)}`, { method: 'DELETE' });
+                fetchMemory();
+            } catch (e) { alert('削除失敗: ' + e.message); }
+        }
+
+        async function clearAllMemory() {
+            if (!confirm('すべてのメモリを削除しますか？')) return;
+            try {
+                await fetch('/api/memory/clear', { method: 'POST' });
+                fetchMemory();
+            } catch (e) { alert('クリア失敗: ' + e.message); }
         }
 
         // ─── ユーティリティ ─────────────────────────────────────────────

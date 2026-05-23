@@ -2,6 +2,7 @@
 LM Studio Chat - FastAPI アプリケーション（Corpus2Skill 版）
 """
 
+import asyncio
 import httpx
 import json
 import os
@@ -9,6 +10,12 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+
+try:
+    from mem0 import AsyncMemory
+    _MEM0_AVAILABLE = True
+except ImportError:
+    _MEM0_AVAILABLE = False
 
 from dotenv import load_dotenv
 from mcp import ClientSession
@@ -64,11 +71,84 @@ def load_rag_config() -> dict:
 
 
 rag_manager: Corpus2SkillManager | None = None
+mem0_memory: "AsyncMemory | None" = None
+
+
+def _get_embedding_dims(model_name: str) -> int:
+    """sentence-transformers モデルの埋め込み次元数を取得する"""
+    _known = {
+        "paraphrase-multilingual-MiniLM-L12-v2": 384,
+        "all-MiniLM-L6-v2": 384,
+        "all-MiniLM-L12-v2": 384,
+        "paraphrase-MiniLM-L6-v2": 384,
+        "all-mpnet-base-v2": 768,
+        "paraphrase-multilingual-mpnet-base-v2": 768,
+        "nomic-embed-text": 768,
+        "mxbai-embed-large": 1024,
+    }
+    short_name = model_name.split("/")[-1]
+    return _known.get(short_name, _known.get(model_name, 384))
+
+
+def _create_mem0_config() -> dict:
+    host = os.getenv("LM_STUDIO_HOST", "127.0.0.1")
+    port = os.getenv("LM_STUDIO_PORT", "1234")
+    base_url = f"http://{host}:{port}"
+    api_key = os.getenv("LM_STUDIO_API_KEY", "") or "lm-studio"
+    cfg = load_rag_config()
+    llm_model = cfg.get("llm_model") or os.getenv("LM_STUDIO_LLM_MODEL", "") or "local"
+    embed_model = os.getenv(
+        "C2S_EMBED_MODEL",
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    )
+    embedding_dims = _get_embedding_dims(embed_model)
+    return {
+        "llm": {
+            "provider": "openai",
+            "config": {
+                "model": llm_model,
+                "api_key": api_key,
+                "openai_base_url": f"{base_url}/v1",
+                "temperature": 0.1,
+                "max_tokens": 2000,
+            },
+        },
+        "embedder": {
+            "provider": "huggingface",
+            "config": {
+                "model": embed_model,
+                "embedding_dims": embedding_dims,
+            },
+        },
+        "vector_store": {
+            "provider": "qdrant",
+            "config": {
+                "collection_name": "chat_memories",
+                "path": str(BASE_DIR / "mem0_db"),
+                "embedding_model_dims": embedding_dims,
+            },
+        },
+    }
+
+
+def _get_user_id(session: str) -> str:
+    parts = session.split("_", 2)
+    if len(parts) >= 2 and parts[0] == "user":
+        return parts[1]
+    return "default"
+
+
+def _parse_mem0_results(result) -> list[dict]:
+    if isinstance(result, dict):
+        return result.get("results", [])
+    if isinstance(result, list):
+        return result
+    return []
 
 
 @app.on_event("startup")
 async def startup_event():
-    global rag_manager
+    global rag_manager, mem0_memory
     try:
         cfg = load_rag_config()
         base_url = (
@@ -96,6 +176,14 @@ async def startup_event():
     except Exception as e:
         print(f"[Corpus2Skill] 初期化失敗（RAG機能は無効）: {e}")
         rag_manager = None
+
+    if _MEM0_AVAILABLE:
+        try:
+            mem0_memory = AsyncMemory.from_config(_create_mem0_config())
+            print("[mem0] 初期化完了")
+        except Exception as e:
+            print(f"[mem0] 初期化失敗（メモリ機能は無効）: {e}")
+            mem0_memory = None
 
 
 # ─── モデル定義 ─────────────────────────────────────────────────────────
@@ -325,6 +413,7 @@ async def api_chat(request: Request):
     max_tokens  = body.get("max_tokens", 8192)
     tools       = body.get("tools", [])
     use_rag     = body.get("use_rag", False)
+    use_memory  = body.get("use_memory", False)
 
     if not messages:
         return JSONResponse({"error": "メッセージが空です"}, status_code=400)
@@ -337,6 +426,28 @@ async def api_chat(request: Request):
     async def generate():
         chat_messages = list(messages)
         rag_sources: list[dict] = []
+        memory_context: list[dict] = []
+
+        # ── メモリ検索 ──────────────────────────────────────────────────
+        if use_memory and mem0_memory and user_content:
+            yield f"data: {json.dumps({'type': 'status', 'message': '🧠 メモリ検索中...'})}\n\n"
+            try:
+                user_id = _get_user_id(session)
+                results = await mem0_memory.search(
+                    user_content, top_k=5, filters={"user_id": user_id}
+                )
+                memory_context = _parse_mem0_results(results)
+                if memory_context:
+                    memory_text = "\n".join(
+                        f"- {m.get('memory', m.get('text', ''))}"
+                        for m in memory_context
+                    )
+                    chat_messages = [{
+                        "role": "system",
+                        "content": f"【会話の記憶】\n{memory_text}",
+                    }] + chat_messages
+            except Exception as e:
+                print(f"[mem0] 検索エラー: {e}")
 
         # ── RAG 検索 ──────────────────────────────────────────────────
         if use_rag and rag_manager and user_content:
@@ -387,7 +498,25 @@ async def api_chat(request: Request):
         if full_reply:
             append_to_history(session, "assistant", full_reply)
 
-        yield f"data: {json.dumps({'type': 'meta', 'history': get_session_history(session), 'rag_sources': rag_sources})}\n\n"
+        # ── メモリ保存（会話後） ────────────────────────────────────────
+        # infer=False: LLM抽出をスキップして直接埋め込み保存（ローカルLLM互換）
+        if use_memory and mem0_memory and user_content and full_reply:
+            try:
+                user_id = _get_user_id(session)
+                result = await mem0_memory.add(
+                    [
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": full_reply},
+                    ],
+                    user_id=user_id,
+                    infer=False,
+                )
+                added = result.get("results", result) if isinstance(result, dict) else result
+                print(f"[mem0] メモリ保存: {len(added) if isinstance(added, list) else added}")
+            except Exception as e:
+                print(f"[mem0] 追加エラー: {e}")
+
+        yield f"data: {json.dumps({'type': 'meta', 'history': get_session_history(session), 'rag_sources': rag_sources, 'memory_updated': use_memory})}\n\n"
 
     return StreamingResponse(
         generate(),
@@ -550,6 +679,62 @@ async def chat_with_tools_streaming(
             })
 
     yield json.dumps({"type": "error", "content": "⚠️ ツール呼び出しの最大反復回数を超えました。"})
+
+
+# ─── mem0 メモリ API ─────────────────────────────────────────────────────
+
+
+@app.get("/api/memory")
+async def api_get_memory(request: Request):
+    session = check_auth(request)
+    if not session:
+        raise HTTPException(status_code=401, detail="認証が必要です")
+    if not mem0_memory:
+        return JSONResponse({"memories": [], "available": False})
+    try:
+        user_id = _get_user_id(session)
+        result = await mem0_memory.get_all(filters={"user_id": user_id}, top_k=50)
+        memories = _parse_mem0_results(result)
+        return JSONResponse({"memories": memories, "available": True})
+    except Exception as e:
+        return JSONResponse({"memories": [], "available": True, "error": str(e)})
+
+
+@app.delete("/api/memory/{memory_id}")
+async def api_delete_memory(memory_id: str, request: Request):
+    session = check_auth(request)
+    if not session:
+        raise HTTPException(status_code=401, detail="認証が必要です")
+    if not mem0_memory:
+        raise HTTPException(status_code=503, detail="mem0が初期化されていません")
+    try:
+        await mem0_memory.delete(memory_id)
+        return JSONResponse({"status": "deleted"})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/memory/clear")
+async def api_clear_memory(request: Request):
+    session = check_auth(request)
+    if not session:
+        raise HTTPException(status_code=401, detail="認証が必要です")
+    if not mem0_memory:
+        raise HTTPException(status_code=503, detail="mem0が初期化されていません")
+    try:
+        user_id = _get_user_id(session)
+        await mem0_memory.delete_all(user_id=user_id)
+        return JSONResponse({"status": "cleared"})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/memory/status")
+async def api_memory_status(request: Request):
+    session = check_auth(request)
+    if not session:
+        raise HTTPException(status_code=401, detail="認証が必要です")
+    return JSONResponse({"available": mem0_memory is not None})
 
 
 @app.get("/api/history/{session_id}")
